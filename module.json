@@ -1,0 +1,13 @@
+{
+    "id": "gateway",
+    "name": "Gateway",
+    "version": "0.1.0",
+    "description": "HTTP REST gateway with WebSocket transport",
+    "provides": ["http-router"],
+    "subscribes": ["outbound:ws"],
+    "priority": 5,
+    "configKey": "gateway",
+    "configSchema": "./src/config.schema.ts",
+    "configDependencies": ["gateway"],
+    "runtimePermissions": ["--allow-net", "--allow-read", "--allow-env", "--allow-sys"]
+}

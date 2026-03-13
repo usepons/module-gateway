@@ -1,0 +1,9 @@
+{
+    "name": "@pons/module-gateway",
+    "version": "0.1.3",
+    "license": "MIT",
+    "exports": "./runner.ts",
+    "imports": {
+        "hono": "npm:hono@^4.12.4"
+    }
+}
