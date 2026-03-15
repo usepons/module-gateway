@@ -9,5 +9,10 @@
     "configKey": "gateway",
     "configSchema": "./src/config.schema.ts",
     "configDependencies": ["gateway"],
-    "runtimePermissions": ["--allow-net", "--allow-read", "--allow-env", "--allow-sys"]
+    "permissions": {
+        "net": ["0.0.0.0"],
+        "read": [".", "~/.pons/"],
+        "env": ["HOME", "PONS_HOME"],
+        "sys": ["hostname"]
+    }
 }
