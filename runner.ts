@@ -8,11 +8,11 @@
  *   - Outbound routing: bus messages → WS clients
  */
 
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual, createHash } from 'node:crypto';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { ModuleRunner } from 'jsr:@pons/sdk@^0.2';
-import type { ModuleManifest } from 'jsr:@pons/sdk@^0.2';
+import { ModuleRunner } from 'jsr:@pons/sdk@^0.3';
+import type { ModuleManifest } from 'jsr:@pons/sdk@^0.3';
 import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
@@ -80,20 +80,48 @@ class GatewayModule extends ModuleRunner {
     const config = this.config as Record<string, unknown> | null;
     const gw = (config?.gateway ?? {}) as Record<string, unknown>;
     const port = (gw.httpPort as number) ?? 18790;
-    const host = (gw.host as string) ?? '0.0.0.0';
+    const host = (gw.host as string) ?? '127.0.0.1';
 
-    // Auth
+    // Auth — enabled by default unless explicitly disabled
     const auth = (gw.auth ?? {}) as Record<string, unknown>;
-    this.authEnabled = (auth.enabled as boolean) ?? false;
+    this.authEnabled = (auth.enabled as boolean) !== false;
     this.authTokens = (auth.tokens as string[]) ?? [];
+
+    // Security: warn if auth is enabled but no tokens configured
+    if (this.authEnabled && this.authTokens.length === 0) {
+      this.log('warn', 'Auth is enabled but no tokens configured — all authenticated requests will be rejected. Set gateway.auth.tokens in config.yaml or disable auth with gateway.auth.enabled: false');
+    }
 
     // Hono app
     this.app = new Hono();
     this.app.onError((err, c) => {
       this.log('error', `HTTP ${c.req.method} ${c.req.path} failed`, { error: String(err) });
-      return c.json({ error: String(err) }, 500);
+      return c.json({ error: 'Internal server error' }, 500);
     });
-    this.app.use('*', cors());
+    // Security headers
+    this.app.use('*', async (c, next) => {
+      await next();
+      c.header('X-Content-Type-Options', 'nosniff');
+      c.header('X-Frame-Options', 'DENY');
+      c.header('Referrer-Policy', 'no-referrer');
+    });
+
+    // CORS — restrict to localhost origins only
+    this.app.use('*', cors({
+      origin: (origin) => {
+        if (!origin) return origin;
+        try {
+          const url = new URL(origin);
+          if (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '::1') {
+            return origin;
+          }
+        } catch { /* invalid origin */ }
+        return '';
+      },
+      allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+      allowHeaders: ['Content-Type', 'Authorization'],
+      maxAge: 86400,
+    }));
 
     // Auth middleware for /api/* (skip public routes)
     this.app.use('/api/*', async (c, next) => {
@@ -117,23 +145,39 @@ class GatewayModule extends ModuleRunner {
 
   // ─── Auth ──────────────────────────────────────────────────
 
+  /** Timing-safe token comparison to prevent timing attacks (including length leakage). */
+  private tokenMatches(candidate: string): boolean {
+    const candidateHash = createHash('sha256').update(candidate).digest();
+    for (const storedToken of this.authTokens) {
+      const storedHash = createHash('sha256').update(storedToken).digest();
+      if (timingSafeEqual(candidateHash, storedHash)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private authenticate(c: Context): boolean {
     if (!this.authEnabled) return true;
     const header = c.req.header('authorization');
     const token = header?.startsWith('Bearer ') ? header.slice(7) : null;
-    return !!token && this.authTokens.includes(token);
+    return !!token && this.tokenMatches(token);
   }
 
   private authenticateWs(req: Request): boolean {
     if (!this.authEnabled) return true;
-    const url = new URL(req.url);
-    const token = url.searchParams.get('token');
-    if (token && this.authTokens.includes(token)) return true;
+    // Token from Authorization header only (not from URL query string)
     const header = req.headers.get('authorization');
     if (header?.startsWith('Bearer ')) {
-      return this.authTokens.includes(header.slice(7));
+      return this.tokenMatches(header.slice(7));
     }
     return false;
+  }
+
+  /** Authenticate a WS client from their first message (token sent post-connect). */
+  private authenticateWsMessage(token: string): boolean {
+    if (!this.authEnabled) return true;
+    return this.tokenMatches(token);
   }
 
   // ─── Built-in REST routes ──────────────────────────────────
@@ -191,15 +235,19 @@ class GatewayModule extends ModuleRunner {
     // Generic inbound message — publish to bus
     this.app.post('/api/message', async (c) => {
       const body = await c.req.json();
+      // Validate required content field
+      if (typeof body.content !== 'string' || !body.content.trim()) {
+        return c.json({ error: 'content is required and must be a non-empty string' }, 400);
+      }
       this.publish('inbound:message', {
         id: randomUUID(),
         channelType: 'http',
-        channelId: body.channelId ?? 'default',
-        senderId: body.senderId ?? 'http-user',
-        senderName: body.senderName ?? 'HTTP User',
+        channelId: typeof body.channelId === 'string' ? body.channelId : 'default',
+        senderId: typeof body.senderId === 'string' ? body.senderId : 'http-user',
+        senderName: typeof body.senderName === 'string' ? body.senderName : 'HTTP User',
         content: body.content,
         timestamp: new Date().toISOString(),
-        metadata: body.metadata ?? {},
+        metadata: (body.metadata && typeof body.metadata === 'object') ? body.metadata : {},
       });
       return c.json({ status: 'accepted' }, 202);
     });
@@ -207,27 +255,78 @@ class GatewayModule extends ModuleRunner {
 
   // ─── WebSocket ─────────────────────────────────────────────
 
+  private static readonly MAX_WS_CLIENTS = 1000;
+  private static readonly MAX_SUBSCRIPTIONS_PER_CLIENT = 100;
+  private static readonly MAX_CHANNEL_ID_LENGTH = 256;
+  private wsClientChannels = new Map<WebSocket, Set<string>>();
+
   private handleWsUpgrade(req: Request): Response {
-    if (!this.authenticateWs(req)) {
-      return new Response('Unauthorized', { status: 401 });
+    // Security: limit concurrent WebSocket connections
+    if (this.wsClients.size >= GatewayModule.MAX_WS_CLIENTS) {
+      return new Response('Too many connections', { status: 503 });
     }
+    // Allow upgrade — auth can happen via Authorization header or first message
     const { socket, response } = Deno.upgradeWebSocket(req);
+    // Pre-authenticate if Authorization header is present
+    if (this.authenticateWs(req)) {
+      socket.addEventListener('open', () => {
+        this.wsAuthenticated.add(socket);
+      });
+    }
     this.onWsConnection(socket);
     return response;
   }
+
+  /** Set of WS clients that have completed authentication */
+  private wsAuthenticated = new WeakSet<WebSocket>();
 
   private onWsConnection(ws: WebSocket): void {
     const clientId = randomUUID();
 
     ws.onopen = () => {
+      // If auth is disabled, mark as authenticated immediately
+      if (!this.authEnabled) {
+        this.wsAuthenticated.add(ws);
+      }
       this.wsClients.add(ws);
       this.log('debug', 'WS client connected', { clientId, total: this.wsClients.size });
     };
 
     ws.onmessage = (evt) => {
       try {
-        const msg = JSON.parse(String(evt.data)) as WsClientMessage;
-        this.handleWsMessage(ws, clientId, msg);
+        const msg = JSON.parse(String(evt.data));
+        if (typeof msg !== 'object' || msg === null || typeof msg.type !== 'string') {
+          this.log('warn', 'WS malformed message — missing type', { clientId });
+          return;
+        }
+
+        // Handle auth message (must be first message if auth is enabled)
+        if (msg.type === 'auth') {
+          if (typeof msg.token === 'string' && this.authenticateWsMessage(msg.token)) {
+            this.wsAuthenticated.add(ws);
+            this.log('debug', 'WS client authenticated', { clientId });
+          } else {
+            this.log('warn', 'WS auth failed', { clientId });
+            ws.close(4001, 'Authentication failed');
+          }
+          return;
+        }
+
+        // Reject unauthenticated messages
+        if (!this.wsAuthenticated.has(ws)) {
+          this.log('warn', 'WS message before auth — rejecting', { clientId, type: msg.type });
+          ws.close(4001, 'Authentication required');
+          return;
+        }
+
+        // Validate message type against known types
+        const VALID_WS_TYPES = new Set(['subscribe', 'unsubscribe', 'message', 'interaction:resolve', 'run:cancel']);
+        if (!VALID_WS_TYPES.has(msg.type)) {
+          this.log('warn', 'WS unknown message type', { clientId, type: msg.type });
+          return;
+        }
+
+        this.handleWsMessage(ws, clientId, msg as WsClientMessage);
       } catch (err) {
         this.log('warn', 'WS parse error', { clientId, error: String(err) });
       }
@@ -235,6 +334,7 @@ class GatewayModule extends ModuleRunner {
 
     ws.onclose = () => {
       this.wsClients.delete(ws);
+      this.wsClientChannels.delete(ws);
       for (const clients of this.wsChannels.values()) {
         clients.delete(ws);
       }
@@ -248,19 +348,36 @@ class GatewayModule extends ModuleRunner {
 
   private handleWsMessage(ws: WebSocket, clientId: string, msg: WsClientMessage): void {
     switch (msg.type) {
-      case 'subscribe':
+      case 'subscribe': {
+        if (typeof msg.channelId !== 'string' || !msg.channelId) return;
+        if (msg.channelId.length > GatewayModule.MAX_CHANNEL_ID_LENGTH) return;
+        // Security: limit subscriptions per client
+        const clientSubs = this.wsClientChannels.get(ws) ?? new Set<string>();
+        if (clientSubs.size >= GatewayModule.MAX_SUBSCRIPTIONS_PER_CLIENT) {
+          this.log('warn', 'WS subscription limit reached', { clientId, limit: GatewayModule.MAX_SUBSCRIPTIONS_PER_CLIENT });
+          return;
+        }
         if (!this.wsChannels.has(msg.channelId)) {
           this.wsChannels.set(msg.channelId, new Set());
         }
         this.wsChannels.get(msg.channelId)!.add(ws);
+        clientSubs.add(msg.channelId);
+        this.wsClientChannels.set(ws, clientSubs);
         this.log('debug', 'WS subscribed', { clientId, channelId: msg.channelId });
         break;
+      }
 
       case 'unsubscribe':
+        if (typeof msg.channelId !== 'string' || !msg.channelId) return;
         this.wsChannels.get(msg.channelId)?.delete(ws);
+        this.wsClientChannels.get(ws)?.delete(msg.channelId);
         break;
 
       case 'message':
+        // Validate required fields
+        if (typeof msg.channelId !== 'string' || !msg.channelId) return;
+        if (typeof msg.senderId !== 'string' || !msg.senderId) return;
+        if (typeof msg.content !== 'string') return;
         this.publish('inbound:message', {
           id: randomUUID(),
           channelType: 'ws',
@@ -333,10 +450,36 @@ class GatewayModule extends ModuleRunner {
     }
   }
 
+  private static readonly RESERVED_PREFIXES = ['/api/health', '/api/auth', '/api/modules', '/api/services', '/api/commands', '/api/chat', '/api/message'];
+
   private handleRegisterRoutes(reg: HttpRouteRegistration): { ok: true; registered: number } {
     const { service, prefix, middleware = [], routes } = reg;
     if (!service || !prefix || !routes?.length) {
       throw new Error('registerRoutes requires service, prefix, and routes');
+    }
+    // Security: validate prefix format and prevent shadowing built-in routes
+    if (!prefix.startsWith('/') || prefix.includes('..') || prefix.includes('//')) {
+      throw new Error(`Invalid route prefix format: "${prefix}"`);
+    }
+    // Block /api itself — all built-in routes live under /api/*
+    const normalizedPrefix = prefix.replace(/\/+$/, '');
+    if (normalizedPrefix === '/api') {
+      throw new Error('Prefix "/api" is reserved');
+    }
+    // Check each route's full resolved path against reserved routes
+    for (const route of routes) {
+      const fullPath = normalizedPrefix + (route.path === '/' ? '' : route.path);
+      const normalizedFull = fullPath.replace(/\/+$/, '');
+      for (const reserved of GatewayModule.RESERVED_PREFIXES) {
+        const normalizedReserved = reserved.replace(/\/+$/, '');
+        if (
+          normalizedFull === normalizedReserved ||
+          normalizedFull.startsWith(normalizedReserved + '/') ||
+          normalizedReserved.startsWith(normalizedFull + '/')
+        ) {
+          throw new Error(`Route "${fullPath}" conflicts with reserved route "${reserved}"`);
+        }
+      }
     }
 
     this.routeGroups.set(prefix, { service, prefix, middleware, routes });
@@ -385,7 +528,15 @@ class GatewayModule extends ModuleRunner {
 
       if (routeType === 'publish') {
         const body = await c.req.json().catch(() => ({}));
-        this.publish(route.topic!, body);
+        // Security: sanitize user input before publishing to internal bus
+        // JSON round-trip strips __proto__/constructor keys; envelope identifies source
+        const sanitized = JSON.parse(JSON.stringify(body));
+        this.publish(route.topic!, {
+          _source: 'http',
+          _service: service,
+          _timestamp: new Date().toISOString(),
+          payload: sanitized,
+        });
         return c.json({ status: 'accepted' }, 202);
       }
 
@@ -394,9 +545,13 @@ class GatewayModule extends ModuleRunner {
       try {
         const result = await this.request<Record<string, unknown>>(service, `http:${route.handler}`, ctx);
         const status = (result?.status as number) ?? 200;
+        // Security: only allow safe response headers from RPC responses
+        const ALLOWED_RESPONSE_HEADERS = new Set(['content-type', 'cache-control', 'x-request-id', 'etag', 'last-modified']);
         const headers = (result?.headers as Record<string, string>) ?? {};
         for (const [key, value] of Object.entries(headers)) {
-          c.header(key, value);
+          if (ALLOWED_RESPONSE_HEADERS.has(key.toLowerCase())) {
+            c.header(key, value);
+          }
         }
         return c.json(result?.body ?? result, status as ContentfulStatusCode);
       } catch (err) {
@@ -419,21 +574,28 @@ class GatewayModule extends ModuleRunner {
       try { body = await c.req.json(); } catch { /* empty */ }
     }
 
+    // Security: strip sensitive headers before forwarding to downstream services
+    const STRIP_HEADERS = new Set(['authorization', 'cookie', 'set-cookie', 'proxy-authorization']);
     const headers: Record<string, string> = {};
-    c.req.raw.headers.forEach((value, key) => { headers[key] = value; });
+    c.req.raw.headers.forEach((value, key) => {
+      if (!STRIP_HEADERS.has(key.toLowerCase())) {
+        headers[key] = value;
+      }
+    });
 
     return { params, query, body, headers };
   }
 
   private handleRpcError(c: Context, err: unknown, service: string, method: string): Response {
     const msg = err instanceof Error ? err.message : String(err);
+    this.log('error', `RPC error: ${service}.${method}`, { error: msg });
     if (msg.includes('not found') || msg.includes('unavailable')) {
-      return c.json({ error: `Service unavailable: ${service}` }, 503);
+      return c.json({ error: 'Service temporarily unavailable' }, 503);
     }
     if (msg.includes('timed out')) {
-      return c.json({ error: `Service timeout: ${service}.${method}` }, 504);
+      return c.json({ error: 'Request timed out' }, 504);
     }
-    return c.json({ error: msg }, 500);
+    return c.json({ error: 'Internal server error' }, 500);
   }
 
   // ─── Shutdown ──────────────────────────────────────────────
