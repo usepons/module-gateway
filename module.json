@@ -5,6 +5,7 @@
     "description": "HTTP REST gateway with WebSocket transport",
     "provides": ["http-router"],
     "subscribes": ["outbound:ws"],
+    "optionalRequires": ["model-router"],
     "priority": 5,
     "configKey": "gateway",
     "configSchema": "./src/config.schema.ts",
@@ -14,5 +15,9 @@
         "read": [".", "~/.pons/"],
         "env": ["HOME", "PONS_HOME"],
         "sys": ["hostname"]
+    },
+    "capabilities": {
+        "services": ["model-router", "providerRegistry", "authProfileManager", "cost-tracker", "agents", "sessions", "memory", "transcripts", "skills", "identity"],
+        "topics": ["outbound:ws", "inbound:message", "interaction:resolved", "run:cancel"]
     }
 }

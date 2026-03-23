@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"git submodule status 2>/dev/null; echo \\\"---\\\"; cat /Users/mikield/Code/GitHub/usepons/module-gateway/.gitmodules 2>/dev/null; echo \\\"---\\\"; ls -la /Users/mikield/Code/GitHub/usepons/modul...",
-  "error": "Exit code 1\n---\n---",
-  "timestamp": "2026-03-14T21:25:46.230Z",
-  "retry_count": 1
-}

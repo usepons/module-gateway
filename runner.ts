@@ -102,7 +102,8 @@ class GatewayModule extends ModuleRunner {
     this.app.use('*', async (c, next) => {
       await next();
       c.header('X-Content-Type-Options', 'nosniff');
-      c.header('X-Frame-Options', 'DENY');
+      // Allow iframe embedding for sandbox preview routes
+      c.header('X-Frame-Options', c.req.path.startsWith('/sandbox/') ? 'SAMEORIGIN' : 'DENY');
       c.header('Referrer-Policy', 'no-referrer');
     });
 
@@ -131,6 +132,7 @@ class GatewayModule extends ModuleRunner {
     });
 
     this.registerBuiltinRoutes();
+    this.registerSandboxProxy();
 
     // Single server — HTTP + WS upgrades
     this.server = Deno.serve({ port, hostname: host }, (req) => {
@@ -246,10 +248,72 @@ class GatewayModule extends ModuleRunner {
         senderId: typeof body.senderId === 'string' ? body.senderId : 'http-user',
         senderName: typeof body.senderName === 'string' ? body.senderName : 'HTTP User',
         content: body.content,
+        ...(body.agentId ? { agentId: body.agentId } : {}),
         timestamp: new Date().toISOString(),
         metadata: (body.metadata && typeof body.metadata === 'object') ? body.metadata : {},
       });
       return c.json({ status: 'accepted' }, 202);
+    });
+  }
+
+  // ─── Sandbox Preview Proxy ──────────────────────────────────
+
+  private registerSandboxProxy(): void {
+    // Proxy /sandbox/:sandboxId/* to the sandbox preview server
+    this.app.all('/sandbox/:sandboxId/*', async (c) => {
+      // Auth check
+      if (this.authEnabled && !this.authenticate(c)) {
+        return c.json({ error: 'Unauthorized' }, 401);
+      }
+
+      const sandboxId = c.req.param('sandboxId');
+      if (!sandboxId) return c.json({ error: 'Missing sandbox ID' }, 400);
+
+      let state: { previewPort?: number; status?: string } | null = null;
+      try {
+        state = await this.request<{ previewPort?: number; status?: string }>(
+          'sandbox', 'get', { id: sandboxId },
+        );
+      } catch {
+        return c.json({ error: 'Sandbox service unavailable' }, 503);
+      }
+
+      if (!state || state.status !== 'running' || !state.previewPort) {
+        return c.json({ error: 'Sandbox not running or no preview' }, 404);
+      }
+
+      // Extract the remaining path after /sandbox/:id/
+      const url = new URL(c.req.url);
+      const prefix = `/sandbox/${sandboxId}/`;
+      const remaining = url.pathname.slice(prefix.length);
+      const targetUrl = `http://127.0.0.1:${state.previewPort}/${remaining}${url.search}`;
+
+      try {
+        const proxyReq = new Request(targetUrl, {
+          method: c.req.method,
+          headers: c.req.raw.headers,
+          body: c.req.method !== 'GET' && c.req.method !== 'HEAD' ? c.req.raw.body : null,
+        });
+
+        const proxyRes = await fetch(proxyReq);
+
+        // Build response, overriding X-Frame-Options for iframe embedding
+        const headers = new Headers(proxyRes.headers);
+        headers.set('X-Frame-Options', 'SAMEORIGIN');
+
+        return new Response(proxyRes.body, {
+          status: proxyRes.status,
+          headers,
+        });
+      } catch {
+        return c.json({ error: 'Failed to proxy to sandbox preview' }, 502);
+      }
+    });
+
+    // Also handle the bare /sandbox/:sandboxId route (no trailing content)
+    this.app.all('/sandbox/:sandboxId', (c) => {
+      const sandboxId = c.req.param('sandboxId');
+      return c.redirect(`/sandbox/${sandboxId}/`, 302);
     });
   }
 
@@ -385,11 +449,11 @@ class GatewayModule extends ModuleRunner {
           senderId: msg.senderId,
           senderName: msg.senderName ?? msg.senderId,
           content: msg.content,
+          ...(msg.agentId ? { agentId: msg.agentId } : {}),
+          ...(msg.sessionId ? { sessionId: msg.sessionId } : {}),
           timestamp: new Date().toISOString(),
           metadata: {
             ...(msg.metadata ?? {}),
-            ...(msg.agentId ? { agentId: msg.agentId } : {}),
-            ...(msg.sessionId ? { sessionId: msg.sessionId } : {}),
           },
         });
         break;
