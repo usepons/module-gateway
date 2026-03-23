@@ -1,8 +1,10 @@
 {
     "id": "gateway",
     "name": "Gateway",
-    "version": "0.1.0",
+    "version": "0.2.2",
     "description": "HTTP REST gateway with WebSocket transport",
+    "runtime": "deno",
+    "entry": "runner.ts",
     "provides": ["http-router"],
     "subscribes": ["outbound:ws"],
     "optionalRequires": ["model-router"],

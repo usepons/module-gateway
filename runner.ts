@@ -56,9 +56,13 @@ class GatewayModule extends ModuleRunner {
   readonly manifest: ModuleManifest = {
     id: 'gateway',
     name: 'Gateway',
-    version: '0.1.0',
+    version: '0.2.2',
     subscribes: ['outbound:ws'],
     provides: ['http-router'],
+    optionalRequires: ['model-router'],
+    configKey: 'gateway',
+    configSchema: './src/config.schema.ts',
+    priority: 5,
   };
 
   private app!: Hono;
